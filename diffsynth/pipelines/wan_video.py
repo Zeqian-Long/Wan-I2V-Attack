@@ -205,22 +205,35 @@ class WanVideoPipeline(BasePipeline):
     
     
     def encode_image(self, image, end_image, num_frames, height, width, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        image = self.preprocess_image(image.resize((width, height))).to(self.device)
-        clip_context = self.image_encoder.encode_image([image])
-        msk = torch.ones(1, num_frames, height//8, width//8, device=self.device)
-        msk[:, 1:] = 0
-        if end_image is not None:
-            end_image = self.preprocess_image(end_image.resize((width, height))).to(self.device)
-            vae_input = torch.concat([image.transpose(0,1), torch.zeros(3, num_frames-2, height, width).to(image.device), end_image.transpose(0,1)],dim=1)
-            if self.dit.has_image_pos_emb:
-                clip_context = torch.concat([clip_context, self.image_encoder.encode_image([end_image])], dim=1)
-            msk[:, -1:] = 1
+        if isinstance(image, torch.Tensor):
+            # image = image.to(torch.float32)
+            # image = image * (2.0 / 255.0) - 1.0 
+            image = image.to(self.device)
+            print("Image Shape:", image.shape)
+            print("Image Type:", type(image))
+            print("Image Device:", image.device)
         else:
-            vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, num_frames-1, height, width).to(image.device)], dim=1)
+            image = self.preprocess_image(image.resize((width, height))).to(self.device)
+            print("Image Shape:", image.shape)
+            print("Image Type:", type(image))
+            print("Image Device:", image.device)
 
-        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
-        msk = msk.transpose(1, 2)[0]
+        with torch.no_grad():
+            clip_context = self.image_encoder.encode_image([image])
+            msk = torch.ones(1, num_frames, height//8, width//8, device=self.device)
+            msk[:, 1:] = 0
+            if end_image is not None:
+                end_image = self.preprocess_image(end_image.resize((width, height))).to(self.device)
+                vae_input = torch.concat([image.transpose(0,1), torch.zeros(3, num_frames-2, height, width).to(image.device), end_image.transpose(0,1)],dim=1)
+                if self.dit.has_image_pos_emb:
+                    clip_context = torch.concat([clip_context, self.image_encoder.encode_image([end_image])], dim=1)
+                msk[:, -1:] = 1
+            else:
+                vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, num_frames-1, height, width).to(image.device)], dim=1)
+    
+            msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+            msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
+            msk = msk.transpose(1, 2)[0]
         
         y = self.vae.encode([vae_input.to(dtype=self.torch_dtype, device=self.device)], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
         y = y.to(dtype=self.torch_dtype, device=self.device)
@@ -229,7 +242,8 @@ class WanVideoPipeline(BasePipeline):
         clip_context = clip_context.to(dtype=self.torch_dtype, device=self.device)
         y = y.to(dtype=self.torch_dtype, device=self.device)
         return {"clip_feature": clip_context, "y": y}
-    
+
+
     
     def encode_control_video(self, control_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
         control_video = self.preprocess_images(control_video)

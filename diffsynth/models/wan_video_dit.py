@@ -143,6 +143,16 @@ class SelfAttention(nn.Module):
         v = self.v(x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
+
+
+        # Attention map 
+        B, S, D = q.shape
+        q_ = q.view(B, S, self.num_heads, D // self.num_heads).transpose(1, 2)  # (B, H, S, d)
+        k_ = k.view(B, S, self.num_heads, D // self.num_heads).transpose(1, 2)  # (B, H, S, d)
+        attn_map = torch.softmax(torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(D // self.num_heads), dim=-1)
+        self.last_attn = attn_map.detach()
+
+
         x = self.attn(q, k, v)
         return self.o(x)
 
