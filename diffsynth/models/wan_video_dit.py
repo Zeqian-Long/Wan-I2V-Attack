@@ -137,21 +137,26 @@ class SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
+    def forward(self, x, freqs, block_id):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
 
+        # Compute and store attention map (for cetain layers)
+        if block_id == 2:
+            with torch.no_grad():
+                B, S, D = q.shape
+                N = min(512, S)
 
-        # Attention map 
-        B, S, D = q.shape
-        q_ = q.view(B, S, self.num_heads, D // self.num_heads).transpose(1, 2)  # (B, H, S, d)
-        k_ = k.view(B, S, self.num_heads, D // self.num_heads).transpose(1, 2)  # (B, H, S, d)
-        attn_map = torch.softmax(torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(D // self.num_heads), dim=-1)
-        self.last_attn = attn_map.detach()
+                q_ = q[:, :N, :].view(B, N, self.num_heads, D // self.num_heads).transpose(1, 2)
+                k_ = k[:, :N, :].view(B, N, self.num_heads, D // self.num_heads).transpose(1, 2)
+                print(q_.shape, k_.shape)
 
+                attn_scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(D // self.num_heads)
+                attn_map = torch.softmax(attn_scores, dim=-1)
+                self.last_attn = attn_map.detach().cpu().float()  # [B, H, S, S]
 
         x = self.attn(q, k, v)
         return self.o(x)
@@ -221,12 +226,12 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, block_id):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, block_id=block_id))
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -376,7 +381,7 @@ class WanModel(torch.nn.Module):
                 return module(*inputs)
             return custom_forward
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
@@ -392,7 +397,7 @@ class WanModel(torch.nn.Module):
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, block_id=i)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

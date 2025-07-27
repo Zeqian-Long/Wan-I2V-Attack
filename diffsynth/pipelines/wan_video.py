@@ -206,8 +206,6 @@ class WanVideoPipeline(BasePipeline):
     
     def encode_image(self, image, end_image, num_frames, height, width, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
         if isinstance(image, torch.Tensor):
-            # image = image.to(torch.float32)
-            # image = image * (2.0 / 255.0) - 1.0 
             image = image.to(self.device)
             print("Image Shape:", image.shape)
             print("Image Type:", type(image))
