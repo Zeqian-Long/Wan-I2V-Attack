@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
 CACHE_T = 2
 
@@ -326,6 +328,7 @@ class Encoder3d(nn.Module):
                                   CausalConv3d(out_dim, z_dim, 3, padding=1))
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        # 3 -> 96
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -335,7 +338,7 @@ class Encoder3d(nn.Module):
                     feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
                         cache_x.device), cache_x
                 ],
-                                    dim=2)
+                                    dim=2)                     
             x = self.conv1(x, feat_cache[idx])
             feat_cache[idx] = cache_x
             feat_idx[0] += 1
@@ -349,12 +352,32 @@ class Encoder3d(nn.Module):
             else:
                 x = layer(x)
 
-        ## middle
+        # x = x.squeeze(0).squeeze(1)   # [C, H, W]
+        # C, H, W = x.shape
+        # feat = x.permute(1, 2, 0).reshape(-1, C).to(torch.float32).cpu().numpy()
+        # pca = PCA(n_components=3)
+        # feat_3d = pca.fit_transform(feat) 
+        # feat_3d -= feat_3d.min(0)
+        # feat_3d /= feat_3d.max(0)
+        # img = feat_3d.reshape(H, W, 3)
+        # plt.imsave("mid_x_pca.png", img) 
+
+
         for layer in self.middle:
             if check_is_instance(layer, ResidualBlock) and feat_cache is not None:
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+        # print(x)
+        # x = x.squeeze(0).squeeze(1)   # [C, H, W]
+        # C, H, W = x.shape
+        # feat = x.permute(1, 2, 0).reshape(-1, C).to(torch.float32).cpu().numpy()
+        # pca = PCA(n_components=3)
+        # feat_3d = pca.fit_transform(feat) 
+        # feat_3d -= feat_3d.min(0)
+        # feat_3d /= feat_3d.max(0)
+        # img = feat_3d.reshape(H, W, 3)
+        # plt.imsave("mid_x_pca.png", img) 
 
         ## head
         for layer in self.head:
@@ -373,6 +396,7 @@ class Encoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+        
         return x
 
 
@@ -530,7 +554,7 @@ class VideoVAE_(nn.Module):
 
         for i in range(iter_):
             self._enc_conv_idx = [0]
-            if i == 0:
+            if i == 0: # [1, 3, 1, 480, 832]
                 out = self.encoder(x[:, :, :1, :, :],
                                    feat_cache=self._enc_feat_map,
                                    feat_idx=self._enc_conv_idx)
@@ -539,7 +563,10 @@ class VideoVAE_(nn.Module):
                                     feat_cache=self._enc_feat_map,
                                     feat_idx=self._enc_conv_idx)
                 out = torch.cat([out, out_], 2)
+        
+        # print(out.shape)
         mu, log_var = self.conv1(out).chunk(2, dim=1)
+        # print(mu.shape)
         if isinstance(scale[0], torch.Tensor):
             scale = [s.to(dtype=mu.dtype, device=mu.device) for s in scale]
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
@@ -547,6 +574,8 @@ class VideoVAE_(nn.Module):
         else:
             scale = scale.to(dtype=mu.dtype, device=mu.device)
             mu = (mu - scale[0]) * scale[1]
+        # print(mu.shape)
+        # import pdb; pdb.set_trace()
         return mu
 
     def decode(self, z, scale):
@@ -774,11 +803,18 @@ class WanVideoVAE(nn.Module):
 
 
     def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        if tiled:
-            video = self.tiled_decode(hidden_states, device, tile_size, tile_stride)
-        else:
-            video = self.single_decode(hidden_states, device)
-        return video
+        hidden_states = [hidden_state.to("cpu") for hidden_state in hidden_states]
+        videos = []
+        for hidden_state in hidden_states:
+            hidden_state = hidden_state.unsqueeze(0)
+            if tiled:
+                video = self.tiled_decode(hidden_state, device, tile_size, tile_stride)
+            else:
+                video = self.single_decode(hidden_state, device)
+            video = video.squeeze(0)
+            videos.append(video)
+        videos = torch.stack(videos)
+        return videos
 
 
     @staticmethod

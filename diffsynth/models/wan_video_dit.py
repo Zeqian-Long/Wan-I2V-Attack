@@ -5,7 +5,6 @@ import math
 from typing import Tuple, Optional
 from einops import rearrange
 from .utils import hash_state_dict_keys
-from .wan_video_camera_controller import SimpleAdapter
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
@@ -37,8 +36,6 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
         x = flash_attn_interface.flash_attn_func(q, k, v)
-        if isinstance(x,tuple):
-            x = x[0]
         x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
     elif FLASH_ATTN_2_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
@@ -137,27 +134,12 @@ class SelfAttention(nn.Module):
         
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs, block_id):
+    def forward(self, x, freqs):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
-
-        # Compute and store attention map (for cetain layers)
-        if block_id == 2:
-            with torch.no_grad():
-                B, S, D = q.shape
-                N = min(512, S)
-
-                q_ = q[:, :N, :].view(B, N, self.num_heads, D // self.num_heads).transpose(1, 2)
-                k_ = k[:, :N, :].view(B, N, self.num_heads, D // self.num_heads).transpose(1, 2)
-                print(q_.shape, k_.shape)
-
-                attn_scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(D // self.num_heads)
-                attn_map = torch.softmax(attn_scores, dim=-1)
-                self.last_attn = attn_map.detach().cpu().float()  # [B, H, S, S]
-
         x = self.attn(q, k, v)
         return self.o(x)
 
@@ -189,16 +171,33 @@ class CrossAttention(nn.Module):
             ctx = y[:, 257:]
         else:
             ctx = y
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(ctx))
+        q = self.norm_q(self.q(x)) # [1, 6240, 5120]
+        k = self.norm_k(self.k(ctx)) # [1, 512, 5120]
         v = self.v(ctx)
         x = self.attn(q, k, v)
+
+        attn_scores_text = torch.matmul(q, k.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
+        # attn_map_text = F.softmax(attn_scores_text, dim=-1) # [1, 6240, 512]
+        attn_map_text = attn_scores_text
+
+        # print("attn_map_text:", attn_map_text.shape)
+        # print(attn_map_text)
         if self.has_image_input:
-            k_img = self.norm_k_img(self.k_img(img))
+            k_img = self.norm_k_img(self.k_img(img)) # [1, 257, 5120]
             v_img = self.v_img(img)
             y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
+
+            attn_scores_img = torch.matmul(q, k_img.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
+            # attn_map_img = F.softmax(attn_scores_img, dim=-1) # [1, 6240, 257]
+            attn_map_img = attn_scores_img
+            # print("attn_map_img:", attn_map_img.shape)
+            # print(attn_map_img)
+
+            attn_map = torch.cat([attn_map_img, attn_map_text], dim=-1) 
+            # print("attn_map:", attn_map.shape)
+            # print(attn_map)
             x = x + y
-        return self.o(x)
+        return self.o(x), attn_map if self.has_image_input else None
 
 
 class GateModule(nn.Module):
@@ -226,20 +225,21 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs, block_id):
+    def forward(self, x, context, t_mod, freqs):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, block_id=block_id))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        a, attn_map = self.cross_attn(self.norm3(x), context)
+        x = x + a
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
-        return x
+        return x, attn_map
 
 
 class MLP(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, has_pos_emb=False):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
         self.proj = torch.nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -248,13 +248,8 @@ class MLP(torch.nn.Module):
             nn.Linear(in_dim, out_dim),
             nn.LayerNorm(out_dim)
         )
-        self.has_pos_emb = has_pos_emb
-        if has_pos_emb:
-            self.emb_pos = torch.nn.Parameter(torch.zeros((1, 514, 1280)))
 
     def forward(self, x):
-        if self.has_pos_emb:
-            x = x + self.emb_pos.to(dtype=x.dtype, device=x.device)
         return self.proj(x)
 
 
@@ -287,10 +282,6 @@ class WanModel(torch.nn.Module):
         num_heads: int,
         num_layers: int,
         has_image_input: bool,
-        has_image_pos_emb: bool = False,
-        has_ref_conv: bool = False,
-        add_control_adapter: bool = False,
-        in_dim_control_adapter: int = 24,
     ):
         super().__init__()
         self.dim = dim
@@ -321,22 +312,10 @@ class WanModel(torch.nn.Module):
         self.freqs = precompute_freqs_cis_3d(head_dim)
 
         if has_image_input:
-            self.img_emb = MLP(1280, dim, has_pos_emb=has_image_pos_emb)  # clip_feature_dim = 1280
-        if has_ref_conv:
-            self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
-        self.has_image_pos_emb = has_image_pos_emb
-        self.has_ref_conv = has_ref_conv
-        if add_control_adapter:
-            self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:])
-        else:
-            self.control_adapter = None
+            self.img_emb = MLP(1280, dim)  # clip_feature_dim = 1280
 
-    def patchify(self, x: torch.Tensor,control_camera_latents_input: torch.Tensor = None):
+    def patchify(self, x: torch.Tensor):
         x = self.patch_embedding(x)
-        if self.control_adapter is not None and control_camera_latents_input is not None:
-            y_camera = self.control_adapter(control_camera_latents_input)
-            x = [u + v for u, v in zip(x, y_camera)]
-            x = x[0].unsqueeze(0)
         grid_size = x.shape[2:]
         x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
         return x, grid_size  # x, grid_size: (f, h, w)
@@ -381,7 +360,7 @@ class WanModel(torch.nn.Module):
                 return module(*inputs)
             return custom_forward
 
-        for i, block in enumerate(self.blocks):
+        for block in self.blocks:
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
@@ -397,7 +376,7 @@ class WanModel(torch.nn.Module):
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, t_mod, freqs, block_id=i)
+                x, _ = block(x, context, t_mod, freqs)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
@@ -490,7 +469,6 @@ class WanModelStateDictConverter:
         return state_dict_, config
     
     def from_civitai(self, state_dict):
-        state_dict = {name: param for name, param in state_dict.items() if not name.startswith("vace")}
         if hash_state_dict_keys(state_dict) == "9269f8db9040a9d860eaca435be61814":
             config = {
                 "has_image_input": False,
@@ -532,147 +510,6 @@ class WanModelStateDictConverter:
                 "num_heads": 40,
                 "num_layers": 40,
                 "eps": 1e-6
-            }
-        elif hash_state_dict_keys(state_dict) == "6d6ccde6845b95ad9114ab993d917893":
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 36,
-                "dim": 1536,
-                "ffn_dim": 8960,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 12,
-                "num_layers": 30,
-                "eps": 1e-6
-            }
-        elif hash_state_dict_keys(state_dict) == "6bfcfb3b342cb286ce886889d519a77e":
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 36,
-                "dim": 5120,
-                "ffn_dim": 13824,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 40,
-                "num_layers": 40,
-                "eps": 1e-6
-            }
-        elif hash_state_dict_keys(state_dict) == "349723183fc063b2bfc10bb2835cf677":
-            # 1.3B PAI control
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 48,
-                "dim": 1536,
-                "ffn_dim": 8960,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 12,
-                "num_layers": 30,
-                "eps": 1e-6
-            }
-        elif hash_state_dict_keys(state_dict) == "efa44cddf936c70abd0ea28b6cbe946c":
-            # 14B PAI control
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 48,
-                "dim": 5120,
-                "ffn_dim": 13824,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 40,
-                "num_layers": 40,
-                "eps": 1e-6
-            }
-        elif hash_state_dict_keys(state_dict) == "3ef3b1f8e1dab83d5b71fd7b617f859f":
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 36,
-                "dim": 5120,
-                "ffn_dim": 13824,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 40,
-                "num_layers": 40,
-                "eps": 1e-6,
-                "has_image_pos_emb": True
-            }
-        elif hash_state_dict_keys(state_dict) == "70ddad9d3a133785da5ea371aae09504":
-            # 1.3B PAI control v1.1
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 48,
-                "dim": 1536,
-                "ffn_dim": 8960,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 12,
-                "num_layers": 30,
-                "eps": 1e-6,
-                "has_ref_conv": True
-            }
-        elif hash_state_dict_keys(state_dict) == "26bde73488a92e64cc20b0a7485b9e5b":
-            # 14B PAI control v1.1
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 48,
-                "dim": 5120,
-                "ffn_dim": 13824,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 40,
-                "num_layers": 40,
-                "eps": 1e-6,
-                "has_ref_conv": True
-            }
-        elif hash_state_dict_keys(state_dict) == "ac6a5aa74f4a0aab6f64eb9a72f19901":
-            # 1.3B PAI control-camera v1.1
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 32,
-                "dim": 1536,
-                "ffn_dim": 8960,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 12,
-                "num_layers": 30,
-                "eps": 1e-6,
-                "has_ref_conv": False,
-                "add_control_adapter": True,
-                "in_dim_control_adapter": 24,
-            }
-        elif hash_state_dict_keys(state_dict) == "b61c605c2adbd23124d152ed28e049ae":
-            # 14B PAI control-camera v1.1
-            config = {
-                "has_image_input": True,
-                "patch_size": [1, 2, 2],
-                "in_dim": 32,
-                "dim": 5120,
-                "ffn_dim": 13824,
-                "freq_dim": 256,
-                "text_dim": 4096,
-                "out_dim": 16,
-                "num_heads": 40,
-                "num_layers": 40,
-                "eps": 1e-6,
-                "has_ref_conv": False,
-                "add_control_adapter": True,
-                "in_dim_control_adapter": 24,
             }
         else:
             config = {}
