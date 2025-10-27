@@ -141,7 +141,16 @@ class SelfAttention(nn.Module):
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
         x = self.attn(q, k, v)
-        return self.o(x)
+
+        # Self attention loss
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
+        self_attn_map = torch.softmax(attn_scores, dim=-1)
+        N = self_attn_map.size(-1)
+        uniform = torch.full_like(self_attn_map, 1.0 / N) 
+        l2_per_row = torch.sqrt(((self_attn_map - uniform) ** 2).sum(dim=-1))  # [B, N]
+        self_attn_loss = l2_per_row.mean()
+
+        return self.o(x), self_attn_loss
 
 
 class CrossAttention(nn.Module):
@@ -175,6 +184,8 @@ class CrossAttention(nn.Module):
         k = self.norm_k(self.k(ctx)) # [1, 512, 5120]
         v = self.v(ctx)
         x = self.attn(q, k, v)
+        
+
 
         attn_scores_text = torch.matmul(q, k.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
         # attn_map_text = F.softmax(attn_scores_text, dim=-1) # [1, 6240, 512]
@@ -186,6 +197,7 @@ class CrossAttention(nn.Module):
             k_img = self.norm_k_img(self.k_img(img)) # [1, 257, 5120]
             v_img = self.v_img(img)
             y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
+            # y = torch.ones_like(x) * 1
 
             attn_scores_img = torch.matmul(q, k_img.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
             # attn_map_img = F.softmax(attn_scores_img, dim=-1) # [1, 6240, 257]
@@ -230,12 +242,14 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        self_attn_out, self_attn_loss = self.self_attn(input_x, freqs)
+
+        x = self.gate(x, gate_msa, self_attn_out)
         a, attn_map = self.cross_attn(self.norm3(x), context)
         x = x + a
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
-        return x, attn_map
+        return x, attn_map, self_attn_loss
 
 
 class MLP(torch.nn.Module):

@@ -470,6 +470,7 @@ class Decoder3d(nn.Module):
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
+        
 
         ## middle
         for layer in self.middle:
@@ -484,6 +485,7 @@ class Decoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+
 
         ## head
         for layer in self.head:
@@ -564,9 +566,9 @@ class VideoVAE_(nn.Module):
                                     feat_idx=self._enc_conv_idx)
                 out = torch.cat([out, out_], 2)
         
-        # print(out.shape)
+        
         mu, log_var = self.conv1(out).chunk(2, dim=1)
-        # print(mu.shape)
+
         if isinstance(scale[0], torch.Tensor):
             scale = [s.to(dtype=mu.dtype, device=mu.device) for s in scale]
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
@@ -574,8 +576,6 @@ class VideoVAE_(nn.Module):
         else:
             scale = scale.to(dtype=mu.dtype, device=mu.device)
             mu = (mu - scale[0]) * scale[1]
-        # print(mu.shape)
-        # import pdb; pdb.set_trace()
         return mu
 
     def decode(self, z, scale):

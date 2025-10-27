@@ -102,8 +102,15 @@ class WanPrompter(BasePrompter):
         ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
         ids = ids.to(device)
         mask = mask.to(device)
-        seq_lens = mask.gt(0).sum(dim=1).long()
+
+        # DEBUG: print tokens
+        # tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(ids[0])
+        # print("Tokens:", tokens)
+        # import pdb; pdb.set_trace()
+
+        seq_lens = mask.gt(0).sum(dim=1).long() 
         prompt_emb = self.text_encoder(ids, mask)
         for i, v in enumerate(seq_lens):
             prompt_emb[:, v:] = 0
+
         return prompt_emb

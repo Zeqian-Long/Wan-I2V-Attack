@@ -21,6 +21,8 @@ from ..models.wan_video_vae import RMS_norm, CausalConv3d, Upsample
 
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+import torch.nn.functional as F
+from open_clip import create_model_and_transforms, get_tokenizer
 
 
 class WanVideoPipeline(BasePipeline):
@@ -218,6 +220,7 @@ class WanVideoPipeline(BasePipeline):
         prompt,
         negative_prompt="",
         input_image=None,
+        target_image=None,
         input_video=None,
         denoising_strength=1.0,
         seed=None,
@@ -270,6 +273,13 @@ class WanVideoPipeline(BasePipeline):
         if input_image is not None and self.image_encoder is not None:
             self.load_models_to_device(["image_encoder", "vae"])
             image_emb = self.encode_image(input_image, num_frames, height, width)
+            
+            # DEBUG: To be deleted
+            # image_emb['y'][:, -5:, -1:, :, :] = 1
+            # image_emb["clip_feature"] = torch.full((1, 257, 1280), 200).to(dtype=self.torch_dtype, device=self.device)
+            # image_emb["clip_feature"] = image_emb["clip_feature"] + 200 * torch.randn_like(image_emb["clip_feature"])
+            # target_image = self.preprocess_image(target_image.resize((width, height))).to(self.device)
+            # image_emb["clip_feature"] = self.image_encoder.encode_image([target_image]).to(dtype=self.torch_dtype, device=self.device)
         else:
             image_emb = {}
             
@@ -385,8 +395,20 @@ def model_fn_wan_video(
     
     if dit.has_image_input:
         x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w), c = 20 + 16 (vae_output)
+
         clip_embdding = dit.img_emb(clip_feature)
-        context = torch.cat([clip_embdding, context], dim=1) # (condition)
+
+        # DEBUG: To be deleted
+        # clip_embdding = torch.ones_like(clip_embdding) * 5
+        # print("clip_embdding shape:", clip_embdding.shape)
+        # clip_mean = clip_embdding.mean(dim=1)   # [1, 5120]
+        # context_mean = context.mean(dim=1)       # [1, 5120]
+        # cosine_sim = F.cosine_similarity(clip_mean, context_mean, dim=-1)
+        # cosine_dist = 1 - cosine_sim
+        # print(f"Cosine distance (clip_embedding vs context): {cosine_dist.item():.6f}")
+        # import pdb; pdb.set_trace()
+
+        context = torch.cat([clip_embdding, context], dim=1) # (condition) # (condition) [257, 5120] + [512, 5120] -> [769, 5120]
     
     x, (f, h, w) = dit.patchify(x)
     
@@ -402,6 +424,8 @@ def model_fn_wan_video(
     else:
         tea_cache_update = False
     
+
+    attn_maps = []
     # blocks
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -409,8 +433,38 @@ def model_fn_wan_video(
     if tea_cache_update:
         x = tea_cache.update(x)
     else:
-        for block in dit.blocks:
-            x, _ = block(x, context, t_mod, freqs)
+        save_dir = "cross_attn"
+        os.makedirs(save_dir, exist_ok=True)
+        for block_id, block in enumerate(dit.blocks):
+            x, attn_map, _ = block(x, context, t_mod, freqs)
+            attn_map = F.softmax(attn_map, dim=1)
+            attn_maps.append(attn_map)
+            B, S_q, S_k = attn_map.shape   # [1, 6240, 769]
+            attn_map_3d = attn_map.view(B, f, h, w, S_k) # [1, 4, 30, 52, 769]
+            if block_id != 100:
+                continue
+            if block_id == 5:
+                a1 = attn_map[0, :, 0]   # [6240]
+                attn_loss = 0
+                for idx in range(257, 277):
+                    a2 = attn_map[0, :, idx]  # [6240]
+                    dist = torch.norm(a1 - a2, p=2)
+                    attn_loss += dist.item()
+                print(f"Attention Loss: {attn_loss:.6f}")
+                import pdb; pdb.set_trace()
+
+        #     for token_idx in range(0, 1):
+        #     # token_idx = 257  # Visual token index
+        #         attn_single = attn_map_3d[0, 0, :, :, token_idx]  
+        #         attn_single = attn_single.detach().cpu().float().numpy()
+        #         plt.imshow(attn_single, cmap='turbo')   # 'plasma', 'inferno', 'magma'
+        #         plt.colorbar()
+        #         plt.title(f"Token {token_idx} Attention")
+        #         plt.axis('on')
+        #         save_path = os.path.join(save_dir, f"attn_block{block_id}_token{token_idx}.png")
+        #         plt.savefig(save_path, bbox_inches='tight')
+        #         plt.close()
+        # import pdb; pdb.set_trace()
         if tea_cache is not None:
             tea_cache.store(x)
 
@@ -420,6 +474,46 @@ def model_fn_wan_video(
             x = get_sp_group().all_gather(x, dim=1)
     x = dit.unpatchify(x, (f, h, w))
     return x
+
+
+def prompt_clip_attn_loss(
+    dit,
+    x: torch.Tensor,
+    timestep: torch.Tensor,
+    context: torch.Tensor,
+    clip_feature: torch.Tensor = None,
+    y: torch.Tensor = None,
+    **kwargs,
+):
+    """
+    Compute attention-based loss at block 5 of WanModel.
+    Stops immediately after computing the loss (no prediction head / unpatchify).
+    """
+    t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
+    t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
+    context = dit.text_embedding(context)
+    if dit.has_image_input:
+        x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
+        clip_emb = dit.img_emb(clip_feature)
+        context = torch.cat([clip_emb, context], dim=1)  # [769, 5120]
+    x, (f, h, w) = dit.patchify(x)
+    freqs = torch.cat([
+        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    for block_id, block in enumerate(dit.blocks):
+        x, attn_map, self_attn_loss = block(x, context, t_mod, freqs)
+        attn_map = F.softmax(attn_map, dim=1) 
+        if block_id == 5:
+            a1 = attn_map[0, :, 0]   # [6240]
+            cross_attn_loss = 0
+            for idx in range(257, 357):
+                a2 = attn_map[0, :, idx]  # [6240]
+                dist = torch.norm(a1 - a2, p=2)
+                cross_attn_loss += dist
+            return cross_attn_loss + self_attn_loss * 10
+    return torch.tensor(0.0, device=x.device)
 
 
 
