@@ -105,8 +105,14 @@ class WanPrompter(BasePrompter):
 
         # DEBUG: print tokens
         # tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(ids[0])
-        # print("Tokens:", tokens)
-        # import pdb; pdb.set_trace()
+        # target_idx = [x - 257 for x in [353, 272, 271, 289, 352]]
+        # for idx in target_idx:
+        #     if 0 <= idx < len(tokens):
+        #         print(f"idx={idx}, token='{tokens[idx]}', token_id={ids[0, idx].item()}")
+        #     else:
+        #         print(f"idx={idx} 超出序列长度 {len(tokens)}")
+
+        # import pdb; pdb.set_trace() 
 
         seq_lens = mask.gt(0).sum(dim=1).long() 
         prompt_emb = self.text_encoder(ids, mask)

@@ -143,14 +143,14 @@ class SelfAttention(nn.Module):
         x = self.attn(q, k, v)
 
         # Self attention loss
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
-        self_attn_map = torch.softmax(attn_scores, dim=-1)
-        N = self_attn_map.size(-1)
-        uniform = torch.full_like(self_attn_map, 1.0 / N) 
-        l2_per_row = torch.sqrt(((self_attn_map - uniform) ** 2).sum(dim=-1))  # [B, N]
-        self_attn_loss = l2_per_row.mean()
+        # attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
+        # self_attn_map = torch.softmax(attn_scores, dim=-1)
+        # N = self_attn_map.size(-1)
+        # uniform = torch.full_like(self_attn_map, 1.0 / N) 
+        # l2_per_row = torch.sqrt(((self_attn_map - uniform) ** 2).sum(dim=-1))  # [B, N]
+        # self_attn_loss = l2_per_row.mean()
 
-        return self.o(x), self_attn_loss
+        return self.o(x), None
 
 
 class CrossAttention(nn.Module):
