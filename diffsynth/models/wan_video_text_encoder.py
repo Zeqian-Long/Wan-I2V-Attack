@@ -251,6 +251,7 @@ class WanTextEncoder(torch.nn.Module):
             x = block(x, mask, pos_bias=e)
         x = self.norm(x)
         x = self.dropout(x)
+
         return x
     
     @staticmethod

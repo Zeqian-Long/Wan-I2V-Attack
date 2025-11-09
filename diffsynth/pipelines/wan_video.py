@@ -222,6 +222,7 @@ class WanVideoPipeline(BasePipeline):
         input_image=None,
         target_image=None,
         input_video=None,
+        mask=None,
         denoising_strength=1.0,
         seed=None,
         rand_device="cpu",
@@ -247,7 +248,7 @@ class WanVideoPipeline(BasePipeline):
 
         # Tiler parameters
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
-        # import pdb; pdb.set_trace()
+
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
 
@@ -282,6 +283,19 @@ class WanVideoPipeline(BasePipeline):
             # image_emb["clip_feature"] = self.image_encoder.encode_image([target_image]).to(dtype=self.torch_dtype, device=self.device)
         else:
             image_emb = {}
+        
+        # Encode mask
+        if mask is not None:
+            mask = mask.convert("L")
+            mask_small = mask.resize((width // 8, height // 8), Image.NEAREST)
+            mask_tensor = torch.from_numpy(np.array(mask_small)).float() / 255.0
+            mask_tensor = (mask_tensor > 0.5).float().unsqueeze(0).unsqueeze(0)
+            mask  = mask_tensor.unsqueeze(2).to(self.device)
+            # [1, 1, 1, h//8, w//8]
+        else:
+            mask = None
+
+
             
         # Extra input
         extra_input = self.prepare_extra_input(latents)
@@ -299,9 +313,9 @@ class WanVideoPipeline(BasePipeline):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
 
             # Inference
-            noise_pred_posi = model_fn_wan_video(self.dit, latents, timestep=timestep, **prompt_emb_posi, **image_emb, **extra_input, **tea_cache_posi, **usp_kwargs)
+            noise_pred_posi = model_fn_wan_video(self.dit, latents, timestep=timestep, mask=mask, **prompt_emb_posi, **image_emb, **extra_input, **tea_cache_posi, **usp_kwargs)
             if cfg_scale != 1.0:
-                noise_pred_nega = model_fn_wan_video(self.dit, latents, timestep=timestep, **prompt_emb_nega, **image_emb, **extra_input, **tea_cache_nega, **usp_kwargs)
+                noise_pred_nega = model_fn_wan_video(self.dit, latents, timestep=timestep, mask=mask, **prompt_emb_nega, **image_emb, **extra_input, **tea_cache_nega, **usp_kwargs)
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
@@ -381,6 +395,7 @@ def model_fn_wan_video(
     y: Optional[torch.Tensor] = None,
     tea_cache: TeaCache = None,
     use_unified_sequence_parallel: bool = False,
+    mask: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     if use_unified_sequence_parallel:
@@ -392,10 +407,20 @@ def model_fn_wan_video(
     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
     t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
     context = dit.text_embedding(context)
+
+    if mask is not None:
+        mask_pooled = F.avg_pool3d(mask, kernel_size=(1,2,2), stride=(1,2,2))
+        mask_pooled = (mask_pooled > 0.25).float()
+        mask = mask_pooled.to(x.device)
+        mask_flat = mask_pooled.flatten(1).to(x.device)
+        # [1, (h//16)*(w//16)]
+
+        # print(mask.shape)
+        # print(mask_flat.shape)
+        # import pdb; pdb.set_trace()
     
     if dit.has_image_input:
         x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w), c = 20 + 16 (vae_output)
-
         clip_embdding = dit.img_emb(clip_feature)
 
         # DEBUG: To be deleted
@@ -440,14 +465,31 @@ def model_fn_wan_video(
             attn_map = F.softmax(attn_map, dim=1)
             attn_maps.append(attn_map)
             B, S_q, S_k = attn_map.shape   # [1, 6240, 769]
-            attn_map_3d = attn_map.view(B, f, h, w, S_k) # [1, 4, 30, 52, 769]
+            attn_map_3d = attn_map.view(B, f, h, w, S_k) # [1, F, 30, 52, 769]
             if block_id != 100:
                 continue
             if block_id == 5:
                 a1 = attn_map[0, :, 0]   # [6240]
                 attn_loss = 0
-                for idx in range(257, 277):
+                l2_norms = []
+
+                for idx in range(257, 769):
+                    a2 = attn_map[0, :, idx] * mask_flat[0]        
+                    norm = torch.norm(a2, p=1)                
+                    l2_norms.append(norm.item())
+
+                l2_norms = torch.tensor(l2_norms)                
+                topk_vals, topk_idx = torch.topk(l2_norms, k=5) 
+                topk_true_idx = topk_idx + 257
+                print("Top 5 idx:", topk_true_idx.tolist())
+                print("Top 5 L2 norms:", topk_vals.tolist())
+                import pdb; pdb.set_trace()
+
+
+                for idx in range(257, 769):
                     a2 = attn_map[0, :, idx]  # [6240]
+                    a2 = a2 * mask_flat[0]
+
                     dist = torch.norm(a1 - a2, p=2)
                     attn_loss += dist.item()
                 print(f"Attention Loss: {attn_loss:.6f}")
@@ -483,6 +525,7 @@ def prompt_clip_attn_loss(
     context: torch.Tensor,
     clip_feature: torch.Tensor = None,
     y: torch.Tensor = None,
+    mask: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """
@@ -496,6 +539,13 @@ def prompt_clip_attn_loss(
         x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
         clip_emb = dit.img_emb(clip_feature)
         context = torch.cat([clip_emb, context], dim=1)  # [769, 5120]
+    if mask is not None:
+        mask_pooled = F.avg_pool3d(mask, kernel_size=(1,2,2), stride=(1,2,2))
+        mask_pooled = (mask_pooled > 0.25).float()
+        mask = mask_pooled.to(x.device)
+        mask_flat = mask_pooled.flatten(1).to(x.device)
+        # [1, (h//16)*(w//16)]
+
     x, (f, h, w) = dit.patchify(x)
     freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -503,106 +553,15 @@ def prompt_clip_attn_loss(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
     for block_id, block in enumerate(dit.blocks):
-        x, attn_map, self_attn_loss = block(x, context, t_mod, freqs)
+        x, attn_map, _ = block(x, context, t_mod, freqs)
         attn_map = F.softmax(attn_map, dim=1) 
         if block_id == 5:
             a1 = attn_map[0, :, 0]   # [6240]
             cross_attn_loss = 0
-            for idx in range(257, 357):
+            for idx in range(257, 769):
                 a2 = attn_map[0, :, idx]  # [6240]
                 dist = torch.norm(a1 - a2, p=2)
                 cross_attn_loss += dist
-            return cross_attn_loss + self_attn_loss * 10
+            return cross_attn_loss
     return torch.tensor(0.0, device=x.device)
 
-
-
-def model_fn_wan_video_attack(
-    dit: WanModel,
-    x: torch.Tensor,
-    timestep: torch.Tensor,
-    context: torch.Tensor,
-    clip_feature: Optional[torch.Tensor] = None,
-    y: Optional[torch.Tensor] = None,
-    tea_cache: TeaCache = None,
-    use_unified_sequence_parallel: bool = False,
-    **kwargs,
-):
-    if use_unified_sequence_parallel:
-        import torch.distributed as dist
-        from xfuser.core.distributed import (get_sequence_parallel_rank,
-                                            get_sequence_parallel_world_size,
-                                            get_sp_group)
-    
-    t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
-    t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
-    context = dit.text_embedding(context)
-    
-    if dit.has_image_input:
-        x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w), c = 16 + 20 (vae_output) [1, 16, 4, 60, 104] + [1, 20, 4, 60, 104] -> [1, 36, 4, 60, 104]
-        clip_embdding = dit.img_emb(clip_feature)
-        context = torch.cat([clip_embdding, context], dim=1) # (condition) [257, 5120] + [512, 5120] -> [769, 5120]
-    
-    x, (f, h, w) = dit.patchify(x) # [1, 6240, 1024] , 4, 30, 52
-    
-    freqs = torch.cat([
-        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-    
-    # TeaCache
-    if tea_cache is not None:
-        tea_cache_update = tea_cache.check(dit, x, t_mod)
-    else:
-        tea_cache_update = False
-    
-    attn_maps = []
-    # blocks
-    if use_unified_sequence_parallel:
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
-    if tea_cache_update:
-        x = tea_cache.update(x)
-    else:
-        for block_id, block in enumerate(dit.blocks): # 40 blocks
-            if block_id < 6:
-                x, _ = block(x, context, t_mod, freqs)
-            elif block_id >= 6 and block_id < 7:
-                x, attn_map = block(x, context, t_mod, freqs)
-                attn_maps.append(attn_map)
-                B, S_q, S_k = attn_map.shape   # [1, 6240, 769]
-                attn_map_3d = attn_map.view(B, f, h, w, S_k) # [1, 4, 30, 52, 769]
-
-                attn_tokens = attn_map_3d[0, 0, :, :, :257]   # [30, 52, 257]
-                H, W, T = attn_tokens.shape
-                attn_2d = attn_tokens.reshape(-1, T).detach().cpu().to(torch.float32).numpy()
-                pca = PCA(n_components=3)
-                attn_pca = pca.fit_transform(attn_2d) 
-                attn_pca = (attn_pca - attn_pca.min()) / (attn_pca.max() - attn_pca.min())
-                attn_rgb = attn_pca.reshape(H, W, 3)
-                plt.imsave("attn_map.png", attn_rgb)
-                # print("attn_map_3d:", attn_map_3d.shape)
-                import pdb; pdb.set_trace()
-            else:
-                break
-            
-                
-        # import pdb; pdb.set_trace()
-        if tea_cache is not None:
-            tea_cache.store(x)
-
-    x = dit.head(x, t)
-    if use_unified_sequence_parallel:
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            x = get_sp_group().all_gather(x, dim=1)
-    x = dit.unpatchify(x, (f, h, w))
-
-    attn_tensor = torch.stack(attn_maps, dim=0)  
-    attn_tensor = attn_tensor.squeeze(1)  
-    attn_mean_token = attn_tensor.mean(dim=-1)  
-    attn_mean_block = attn_mean_token.mean(dim=0)  
-    attn_loss = torch.norm(attn_mean_block, p=2) / (attn_mean_block.numel() ** 0.5)
-    print("attn_loss:", attn_loss.item())
-    # import pdb; pdb.set_trace()
-    return x, attn_loss
