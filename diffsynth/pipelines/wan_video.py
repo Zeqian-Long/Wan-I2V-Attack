@@ -461,7 +461,7 @@ def model_fn_wan_video(
         save_dir = "cross_attn"
         os.makedirs(save_dir, exist_ok=True)
         for block_id, block in enumerate(dit.blocks):
-            x, attn_map, _ = block(x, context, t_mod, freqs, block_index=block_id)
+            x, attn_map, _ = block(x, context, t_mod, freqs)
             attn_map = F.softmax(attn_map, dim=1)
             attn_maps.append(attn_map)
             B, S_q, S_k = attn_map.shape   # [1, 6240, 769]
@@ -558,7 +558,7 @@ def prompt_clip_attn_loss(
         if block_id == 5:
             a1 = attn_map[0, :, 0]   # [6240]
             cross_attn_loss = 0
-            for idx in range(257, 457):
+            for idx in range(257, 769):
                 a2 = attn_map[0, :, idx]  # [6240]
                 dist = torch.norm(a1 - a2, p=2)
                 cross_attn_loss += dist

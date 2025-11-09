@@ -3,7 +3,7 @@ import sys
 diffsynth_path = "/workspace/DiffSynth-Studio"
 sys.path.append(diffsynth_path)
 from diffsynth.models.model_manager import ModelManager
-from diffsynth.pipelines.wan_video import WanVideoPipeline, model_fn_wan_video_attack, prompt_clip_attn_loss
+from diffsynth.pipelines.wan_video import WanVideoPipeline, prompt_clip_attn_loss
 from diffsynth.data.video import save_video, VideoData, LowMemoryImageFolder
 from PIL import Image
 
@@ -56,7 +56,7 @@ pipe = setup_pipe_modules(pipe)
 h = 240
 w = 416
 
-image = Image.open("data/cow.jpg").resize((w, h))
+image = Image.open("data/image/swan.jpg").resize((w, h))
 # image = Image.open("I_adv_final.jpg")
 mask = Image.open("data/mask/swan_224.jpg").convert("L")
 
@@ -64,16 +64,53 @@ mask = Image.open("data/mask/swan_224.jpg").convert("L")
 num_frames = 1  
 # 1, 5, 9, 13, ....
 
+def find_farthest_words_auto(img_emb, clip_model, tokenizer, k=20, device="cuda"):
+    img_emb = F.normalize(img_emb, dim=-1)
+    vocab = list(tokenizer.get_vocab().keys())
+    all_text_embs = []
+    batch_size = 256 
+    for i in tqdm(range(0, len(vocab), batch_size)):
+        batch = vocab[i:i+batch_size]
+        text_tokens = tokenizer(batch, padding=True, return_tensors="pt").to(device)
+        with torch.no_grad():
+            text_emb = clip_model.get_text_features(**text_tokens)
+            text_emb = F.normalize(text_emb, dim=-1)
+        all_text_embs.append(text_emb)
+    all_text_embs = torch.cat(all_text_embs, dim=0)
+    sim = img_emb @ all_text_embs.T  # [1, vocab_size]
+    farthest_idx = torch.topk(-sim, k, dim=-1).indices.squeeze(0)
+    farthest_words = [vocab[i] for i in farthest_idx.tolist()]
+    return farthest_words
+
+
+from transformers import CLIPProcessor, CLIPModel
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to("cuda")
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+img_emb = model.get_image_features(**processor(images=image, return_tensors="pt").to("cuda"))
+farthest = find_farthest_words_auto(img_emb, model, processor.tokenizer, k=512)
+
+def tokens_to_sentence(tokens):
+    clean = [t.replace("</w>", "") for t in tokens]
+    merged = []
+    for t in clean:
+        if not merged or merged[-1] != t:
+            merged.append(t)
+    sentence = " ".join(merged)
+    return sentence
+
+sentence = tokens_to_sentence(farthest)
+
 
 # Encode Prompt
 # prompt = "一艘小船正勇敢地乘风破浪前行。蔚蓝的大海波涛汹涌，白色的浪花拍打着船身，但小船毫不畏惧，坚定地驶向远方。阳光洒在水面上，闪烁着金色的光芒，为这壮丽的场景增添了一抹温暖。镜头拉近，可以看到船上的旗帜迎风飘扬，象征着不屈的精神与冒险的勇气。这段画面充满力量，激励人心，展现了面对挑战时的无畏与执着。"
 
-prompt = "在一间无限延伸的绿色实验室中，空气被冰冷的光线分割成无数几何面。地面反射着荧光蓝与猩红的光带，像液态的玻璃在呼吸。墙壁上悬浮着巨大的数字与方程，它们在慢慢旋转，投下灰绿色的阴影。中央站着一个身披银灰外衣的身影，眼中闪烁着金光，周围漂浮着数以百计的透明立方体，每一个立方体里都封存着一段记忆的闪光。突然，顶端的灯光爆裂成黑白交错的涡流，空间开始塌陷，色彩被撕裂成纯粹的蓝与橙的对撞。声音消失，只剩下一种光的震颤，像宇宙在深呼吸。"
+# prompt = "在一间无限延伸的绿色实验室中，空气被冰冷的光线分割成无数几何面。地面反射着荧光蓝与猩红的光带，像液态的玻璃在呼吸。墙壁上悬浮着巨大的数字与方程，它们在慢慢旋转，投下灰绿色的阴影。中央站着一个身披银灰外衣的身影，眼中闪烁着金光，周围漂浮着数以百计的透明立方体，每一个立方体里都封存着一段记忆的闪光。突然，顶端的灯光爆裂成黑白交错的涡流，空间开始塌陷，色彩被撕裂成纯粹的蓝与橙的对撞。声音消失，只剩下一种光的震颤，像宇宙在深呼吸。"
 
-# prompt = "A black swan is swimming gracefully in the river, its feathers glistening under the golden rays of the setting sun. Gentle ripples spread across the calm water as it glides forward, leaving a trail of shimmering reflections. Lush trees arch over the riverbanks, their leaves swaying in the soft evening breeze, while a faint mist rises above the surface, wrapping the scene in quiet serenity."
+# prompt = "A black swan is swimming gracefully in the river."
 
 # prompt = "A miniature blue train pulling several colorful wagons moves along curved railway tracks in a detailed model village. Small trees, grass, and tiny human figures surround the tracks, with a station building and people nearby, creating a realistic diorama scene."
 
+prompt = sentence
 
 pipe.load_models_to_device(["text_encoder"])
 with torch.no_grad():
@@ -103,7 +140,7 @@ saved_features = register_vae_hooks(pipe)
 # # Target Image
 # # target_image = Image.new("RGB", (832, 480), color=(0, 0, 0))
 # target_image = Image.open("data/MIST_Repeated.png").convert("RGB")
-target_image = Image.open("data/MIST_Repeated.png").convert("RGB")
+target_image = Image.open("data/image/MIST_Repeated.png").convert("RGB")
 target_image = target_image.resize((w, h))
 with torch.no_grad():
     image_emb_tgt = pipe.encode_image(
@@ -205,7 +242,7 @@ for step in tqdm(range(num_steps), desc="Optimizing"):
     adv_latents = noise
     extra_input = pipe.prepare_extra_input(adv_latents)
 
-    pipe.scheduler.set_timesteps(num_inference_steps=2, denoising_strength=1.0, shift=5.0)
+    pipe.scheduler.set_timesteps(num_inference_steps=15, denoising_strength=1.0, shift=5.0)
 
     # inverted_latents = flow_inversion(pipe, adv_latents, prompt_emb_posi, extra_input)
     # import pdb; pdb.set_trace()
@@ -228,4 +265,4 @@ for step in tqdm(range(num_steps), desc="Optimizing"):
 
 
 plot_loss_curve(loss_history)
-metrics = save_adv_result(I_adv, I_adv_before, save_path="I_adv_final_cow.jpg")
+metrics = save_adv_result(I_adv, I_adv_before, save_path="I_adv_final_swan.jpg")

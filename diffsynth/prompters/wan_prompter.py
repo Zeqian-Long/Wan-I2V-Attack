@@ -103,6 +103,12 @@ class WanPrompter(BasePrompter):
         ids = ids.to(device)
         mask = mask.to(device)
 
+        # The index of EOS
+        # seq_lens = mask.sum(dim=1).long() 
+        # eos_positions = seq_lens - 1      
+        # print(eos_positions.item())
+
+
         # DEBUG: print tokens
         # tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(ids[0])
         # target_idx = [x - 257 for x in [353, 272, 271, 289, 352]]
@@ -118,5 +124,18 @@ class WanPrompter(BasePrompter):
         prompt_emb = self.text_encoder(ids, mask)
         for i, v in enumerate(seq_lens):
             prompt_emb[:, v:] = 0
+
+        # strength_norm = prompt_emb.norm(dim=-1)
+        # mean_emb = prompt_emb.mean(dim=1, keepdim=True)
+        # strength_dev = (prompt_emb - mean_emb).norm(dim=-1)
+        # semantic_strength = strength_norm + 0.5 * strength_dev 
+        # semantic_strength = semantic_strength * mask.float()
+        # topk = 10
+        # scores, idxs = torch.topk(semantic_strength[0], k=topk)
+        # tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(ids[0])
+
+        # print("\n=== Top semantic tokens ===")
+        # for rank, (idx, score) in enumerate(zip(idxs.tolist(), scores.tolist()), start=1):
+        #     print(f"{rank:2d}. {tokens[idx]} (strength={score:.4f})")
 
         return prompt_emb
