@@ -422,18 +422,7 @@ def model_fn_wan_video(
     if dit.has_image_input:
         x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w), c = 20 + 16 (vae_output)
         clip_embdding = dit.img_emb(clip_feature)
-
-        # DEBUG: To be deleted
-        # clip_embdding = torch.ones_like(clip_embdding) * 5
-        # print("clip_embdding shape:", clip_embdding.shape)
-        # clip_mean = clip_embdding.mean(dim=1)   # [1, 5120]
-        # context_mean = context.mean(dim=1)       # [1, 5120]
-        # cosine_sim = F.cosine_similarity(clip_mean, context_mean, dim=-1)
-        # cosine_dist = 1 - cosine_sim
-        # print(f"Cosine distance (clip_embedding vs context): {cosine_dist.item():.6f}")
-        # import pdb; pdb.set_trace()
-
-        context = torch.cat([clip_embdding, context], dim=1) # (condition) # (condition) [257, 5120] + [512, 5120] -> [769, 5120]
+        context = torch.cat([clip_embdding, context], dim=1) # (condition) [257, 5120] + [512, 5120] -> [769, 5120]
     
     x, (f, h, w) = dit.patchify(x)
     
@@ -461,6 +450,8 @@ def model_fn_wan_video(
         save_dir = "cross_attn"
         os.makedirs(save_dir, exist_ok=True)
         for block_id, block in enumerate(dit.blocks):
+            # if block_id == 3:
+            #     continue
             x, attn_map, _ = block(x, context, t_mod, freqs)
             attn_map = F.softmax(attn_map, dim=1)
             attn_maps.append(attn_map)
@@ -555,13 +546,16 @@ def prompt_clip_attn_loss(
     for block_id, block in enumerate(dit.blocks):
         x, attn_map, _ = block(x, context, t_mod, freqs)
         attn_map = F.softmax(attn_map, dim=1) 
-        if block_id == 5:
-            a1 = attn_map[0, :, 0]   # [6240]
-            cross_attn_loss = 0
-            for idx in range(257, 769):
-                a2 = attn_map[0, :, idx]  # [6240]
-                dist = torch.norm(a1 - a2, p=2)
-                cross_attn_loss += dist
+        cross_attn_loss = 0
+        if block_id == 0:
+            for anchor_idx in range(0, 257):  
+                a1 = attn_map[0, :, anchor_idx]   # [6240]
+                # a1 = attn_map[0, :, 0]   # [6240]
+                for idx in range(257, 769):
+                    a2 = attn_map[0, :, idx]  # [6240]
+                    dist = torch.norm(a1 - a2, p=2)
+                    cross_attn_loss += dist
+                # if block_id == 5:
             return cross_attn_loss
     return torch.tensor(0.0, device=x.device)
 

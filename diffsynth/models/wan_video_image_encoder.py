@@ -863,20 +863,22 @@ class WanImageEncoder(torch.nn.Module):
 
     def encode_image(self, videos):
         # preprocess
-        size = (self.model.image_size,) * 2
+        size = (self.model.image_size,) * 2     # (224, 224)
+
         videos = torch.cat([
             F.interpolate(
                 u,
                 size=size,
                 mode='bicubic',
                 align_corners=False) for u in videos
-        ])
-        videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))
+        ])      # [1, 3, 224, 224]
 
+        videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))     # normalize
         # forward
         dtype = next(iter(self.model.visual.parameters())).dtype
         videos = videos.to(dtype)
-        out = self.model.visual(videos, use_31_block=True)
+        out = self.model.visual(videos, use_31_block=True)      # [1, 257, 1280]
+
         return out
         
     @staticmethod

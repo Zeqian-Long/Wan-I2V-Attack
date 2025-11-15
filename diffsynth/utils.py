@@ -81,17 +81,6 @@ def register_vae_hooks(pipe):
 
 
 def setup_pipe_modules(pipe, enable_vram_management=False, num_persistent_param_in_dit=None):
-    """
-    Move all core submodules of a diffusion pipeline to the correct device and optionally enable VRAM management.
-
-    Args:
-        pipe: The initialized diffusion pipeline (e.g., WanVideoPipeline, FluxPipeline).
-        enable_vram_management (bool): Whether to enable VRAM management.
-        num_persistent_param_in_dit (int, optional): Persistent parameter count for VRAM control.
-
-    Returns:
-        The same pipe, after moving modules and optional VRAM setup.
-    """
     # Move major submodules to the target device if they exist
     for module_name in ["dit", "vae", "image_encoder", "text_encoder"]:
         if hasattr(pipe, module_name):
