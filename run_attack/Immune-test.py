@@ -1,6 +1,7 @@
 import torch
 import sys
 import os
+import yaml
 from diffsynth.models.model_manager import ModelManager
 from diffsynth.pipelines.wan_video import WanVideoPipeline
 from diffsynth.data.video import save_video, VideoData, LowMemoryImageFolder
@@ -34,12 +35,31 @@ pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bflo
 
 # --------------------------------------------- Testing ---------------------------------------------
 
-h = 480
-w = 832
+with open("config.yaml", "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
 
-image = Image.open("attacked/images/train.jpg")
+h = cfg["video"]["height"]
+w = cfg["video"]["width"]
+num_frames = cfg["video"]["num_frames"]
+seed = 0
 
-image = image.resize((w, h))
+image_path = cfg["data"]["image_path"]
+image_name = os.path.basename(image_path)
+name_wo_ext = os.path.splitext(image_name)[0]
+
+good_test_prompts = cfg["prompt"]["good_test"]
+assert len(good_test_prompts) == 4, f"config.yaml prompt.good_test must have exactly 4 entries, got {len(good_test_prompts)}"
+
+adv_image_path = os.path.join("attacked/images", f"{name_wo_ext}.jpg")
+if not os.path.exists(adv_image_path):
+    raise FileNotFoundError(
+        f"Adversarial image not found at {adv_image_path}. Please run Immune-attack.py first."
+    )
+
+image_variants = {
+    "clean": Image.open(image_path).resize((w, h)),
+    "adv": Image.open(adv_image_path).resize((w, h)),
+}
 
 # pipe.enable_vram_management(num_persistent_param_in_dit=6*10**9) # You can set `num_persistent_param_in_dit` to a small number to reduce VRAM required.
 pipe = setup_pipe_modules(pipe)
@@ -48,16 +68,23 @@ pipe = setup_pipe_modules(pipe)
 os.makedirs("attacked/videos", exist_ok=True)
 os.makedirs("attacked/frames", exist_ok=True)
 
-video = pipe(
-    prompt="The blue train slowly pulls away from the station, wheels turning smoothly on the tracks as it gains momentum. It gradually accelerates, weaving through the miniature landscape, passing by tiny trees and figures at a steady pace.",
-    input_image=image,
-    num_inference_steps=25, height=h, width=w,
-    seed=0, tiled=False, num_frames=17, cfg_scale=5,
-)
-save_video(video, "attacked/videos/train.mp4", fps=10, quality=5)
+for variant_name, variant_image in image_variants.items():
+    for prompt_idx, prompt_text in enumerate(good_test_prompts):
+        video = pipe(
+            prompt=prompt_text,
+            input_image=variant_image,
+            num_inference_steps=25, height=h, width=w,
+            seed=seed, tiled=False, num_frames=num_frames, cfg_scale=5,
+        )
 
+        tag = f"{name_wo_ext}_{variant_name}_test{prompt_idx}_seed{seed}"
 
-out_dir = "attacked/frames/train"
-os.makedirs(out_dir, exist_ok=True)
-for i, frame in enumerate(video):
-    frame.save(os.path.join(out_dir, f"{i:04d}.png"))                                                                                                                                                                                                                                                                             
+        video_path = os.path.join("attacked/videos", f"{tag}.mp4")
+        save_video(video, video_path, fps=10, quality=5)
+
+        out_dir = os.path.join("attacked/frames", tag)
+        os.makedirs(out_dir, exist_ok=True)
+        for i, frame in enumerate(video):
+            frame.save(os.path.join(out_dir, f"{i:04d}.png"))
+
+        print(f"Saved {video_path}")
