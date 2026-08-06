@@ -1,14 +1,44 @@
 attack:
   epsilon: 32/255*2
   num_steps: 500
+  # Wan Structural Conditioning Attack (untargeted clean-vs-adversarial temporal deviation)
+  lambda_cov: 0.5      # weight of the smooth-min temporal coverage term J_cov
+  temperature: 0.1     # softmin temperature tau used in J_cov
+  rms_epsilon: 1.0e-6  # numerical epsilon inside the per-position RMS deviation sqrt
+  # Semantic Conditioning Attack: number of leading (high-noise) states of each
+  # collapse-prompt trajectory eligible for per-step timestep sampling.
+  semantic_timestep_pool: 10
 
 data:
   image_path: data/images/train.jpg
   target_image_path: data/images/blackswan.jpg
 
 prompt:
-  source: The blue train slowly pulls away from the station, wheels turning smoothly on the tracks as it gains momentum. It gradually accelerates, weaving through the miniature landscape, passing by tiny trees and figures at a steady pace.
-  target: A giant firework erupts in the night sky, exploding with intense colors and bright sparks that shower down like rain. The chaos of the display sends shockwaves through the air, creating a moment of breathtaking turbulence and excitement.
+  # 6 prompts sampled during PGD optimization (adversarial semantic branch).
+  # Placeholder content -- edit per experiment.
+  good_train:
+    - "The blue train slowly pulls away from the station, wheels turning smoothly on the tracks as it gains momentum. It gradually accelerates, weaving through the miniature landscape, passing by tiny trees and figures at a steady pace."
+    - "A blue toy train rolls along the tracks through a small miniature town, passing tiny houses and trees under a clear sky."
+    - "The little blue train chugs steadily down the winding track, its wheels clacking rhythmically as it moves past the model village."
+    - "A blue train glides smoothly along the rail line, curving gently around the miniature landscape as the camera follows its motion."
+    - "The toy train picks up speed on the tracks, moving past small figures and trees in the diorama, wheels spinning steadily."
+    - "A blue passenger train departs the station platform, slowly gaining speed as it heads out across the tabletop scene."
+
+  # 4 prompts held out for post-attack unseen-prompt evaluation only. Never
+  # loaded during preprocessing or the PGD loop -- see run_attack/Immune-test.py.
+  good_test:
+    - "The blue train travels along the curved track, passing miniature buildings and trees in a peaceful daytime scene."
+    - "A small blue locomotive pulls away from the platform, its wheels turning as it rolls through the toy town."
+    - "The train moves steadily along the rail line, weaving through the miniature landscape under soft lighting."
+    - "A blue train departs slowly from the station, gaining momentum as it travels past the tiny scenery."
+
+  # 4 semantic-collapse target prompts. Each gets its own real denoising
+  # trajectory generated from the clean source image (see preprocess_data.py).
+  collapse:
+    - "A giant firework erupts in the night sky, exploding with intense colors and bright sparks that shower down like rain. The chaos of the display sends shockwaves through the air, creating a moment of breathtaking turbulence and excitement."
+    - "A massive tornado tears through the landscape, uprooting trees and scattering debris violently across the scene."
+    - "A rocket launches into the sky with a deafening roar, trailing thick smoke and fire as it accelerates upward."
+    - "A raging wildfire sweeps across the scene, flames rapidly consuming everything as thick black smoke fills the air."
 
 video:
   denoising_steps: 25
